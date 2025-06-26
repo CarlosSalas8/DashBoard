@@ -77,6 +77,8 @@ async def get_catalog(catalog_type: str):
     if not doc:
         return None
     # limpia recursivamente floats nan/inf
+    
+    print(doc)
     return clean_mongo_document(doc)
 
 

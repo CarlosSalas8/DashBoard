@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Union
 from typing import Optional
 
 class Restaurant(BaseModel):
@@ -46,12 +46,15 @@ class Restaurant(BaseModel):
 
 
 class FilterParams(BaseModel):
-    country: Optional[str] = None
+    country: Optional[Union[str, List[str]]] = None
     city: Optional[str] = None
     province: Optional[str] = None
     service: Optional[float] = None
-    meal_list: Optional[str] = None
-    cuisines_list: Optional[str] = None
+    food: Optional[float] = None
+    claimed: Optional[str] = None
+    meal_list: Optional[List[str]] = None  # Corregido: era meal_list, no meals_list
+    cuisines_list: Optional[List[str]] = None
+    top_tags_list: Optional[List[str]] = None
     price_level_cat: Optional[str] = None
 
 

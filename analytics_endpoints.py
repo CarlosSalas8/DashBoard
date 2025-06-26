@@ -1,138 +1,336 @@
+from typing import Any, Optional
 from fastapi import APIRouter
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from database import db
 from models import FilterParams
 from database import collection
 from models import FilterLocationParams
-
+from fastapi import APIRouter, Query
+import math
 
 router = APIRouter()
 
+def sanitize(obj: Any) -> Any:
+    """
+    Recursively replace NaN or infinite floats with None so JSON serialization won't fail.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+def is_valid_filter_value(value: Any) -> bool:
+    """
+    Returns False for None, empty string, "string", or empty list.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str):
+        s = value.strip().lower()
+        return s != "" and s != "string"
+    if isinstance(value, list):
+        return bool(value) and all(
+            isinstance(item, str) and item.strip().lower() not in ("", "string")
+            for item in value
+        )
+    return True
 
 @router.post("/analytics")
-async def get_analytics(filters: FilterParams):
-    # Construir el match dinámico
-    match_stage = {}
-    if filters.country and filters.country.lower() != "string":
-        match_stage["country"] = filters.country
-    if filters.city and filters.city.lower() != "string":
-        match_stage["city"] = filters.city
-    if filters.province and filters.province.lower() != "string":
-        match_stage["province"] = filters.province
-    if filters.service is not None and filters.service != 0:
-        match_stage["service"] = filters.service
-    if filters.meal_list and filters.meal_list.lower() != "string":
-        match_stage["meals_list"] = {"$in": [filters.meal_list]}
-    if filters.cuisines_list and filters.cuisines_list.lower() != "string":
-        match_stage["cuisines_list"] = {"$in": [filters.cuisines_list]}
-    if filters.price_level_cat and filters.price_level_cat.lower() != "string":
-        match_stage["price_level_cat"] = filters.price_level_cat
+async def get_analytics(
+    filters:   FilterParams,
+    north:     float = Query(..., ge=-90, le=90),
+    south:     float = Query(..., ge=-90, le=90),
+    east:      float = Query(..., ge=-180, le=180),
+    west:      float = Query(..., ge=-180, le=180),
+    zoom:      float = Query(..., ge=0, le=22),
+    page:      int   = Query(1, ge=1),
+    limit:    Optional[int] = Query(None, ge=1, le=1000),
+):
+    try:
+        # 1) Build match_stage from filters
+        match_stage: dict = {}
+        if is_valid_filter_value(filters.country):
+            match_stage["country"] = (
+                {"$in": filters.country}
+                if isinstance(filters.country, list)
+                else filters.country
+            )
+        for fld in ("city", "province", "claimed", "price_level_cat"):
+            v = getattr(filters, fld)
+            if is_valid_filter_value(v):
+                match_stage[fld] = v
+        for fld in ("service", "food"):
+            v = getattr(filters, fld)
+            if v is not None and v > 0:
+                match_stage[fld] = {"$gte": v}
+        for filt, dbf in (
+            ("meal_list", "meals_list"),
+            ("cuisines_list", "cuisines_list"),
+            ("top_tags_list", "top_tags_list"),
+        ):
+            vals = getattr(filters, filt)
+            if is_valid_filter_value(vals):
+                match_stage[dbf] = {"$in": vals}
 
-    # Pipeline de agregación
-    pipeline = [
-        {"$match": match_stage},
-        {"$project": {
-            "vegetarian": {"$eq": [{"$toLower": "$vegetarian_friendly"}, "si"]},
-            "vegan": {"$eq": [{"$toLower": "$vegan_options"}, "si"]},
-            "gluten": {"$eq": [{"$toLower": "$gluten_free"}, "si"]},
-            "rating": {
-                "$cond": [
-                    {"$and": [
-                        {"$gt": ["$avg_rating", 0]},
-                        {"$isNumber": "$avg_rating"}
-                    ]},
-                    "$avg_rating",
-                    None
-                ]
-            },
-            "price_value": {
-                "$switch": {
-                    "branches": [
-                        {"case": {"$eq": [{"$toLower": "$price_level_cat"}, "barato"]}, "then": 1},
-                        {"case": {"$eq": [{"$toLower": "$price_level_cat"}, "regular"]}, "then": 2},
-                        {"case": {"$eq": [{"$toLower": "$price_level_cat"}, "caro"]}, "then": 3}
-                    ],
-                    "default": None
+        # 2) Apply bounding box
+        match_stage["latitude"]  = {"$gte": south, "$lte": north}
+        match_stage["longitude"] = {"$gte": west,  "$lte": east}
+
+        # 3) Compute overall stats with percentages
+        stats_pipeline = [
+            {"$match": match_stage},
+            {"$addFields": {
+                "vegan":          {"$eq":[{"$toLower":{"$toString":"$vegan_options"}}, "si"]},
+                "gluten":         {"$eq":[{"$toLower":{"$toString":"$gluten_free"}},   "si"]},
+                "valid_rating":   {"$cond":[
+                                      {"$and":[
+                                          {"$ne":["$avg_rating", None]},
+                                          {"$isNumber":"$avg_rating"},
+                                          {"$gt":["$avg_rating",   0]},
+                                          {"$lte":["$avg_rating",   5]}
+                                      ]},
+                                      "$avg_rating",
+                                      None
+                                  ]},
+                "price_numeric":  {"$switch":{
+                                      "branches":[
+                                          {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "barato"]},  "then":1},
+                                          {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "regular"]}, "then":2},
+                                          {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "caro"]},    "then":3}
+                                      ],
+                                      "default": None
+                                  }}
+            }},
+            {"$group": {
+                "_id": None,
+                "total":             {"$sum": 1},
+                "vegan_count":       {"$sum":{"$cond":["$vegan", 1, 0]}},
+                "gluten_free_count": {"$sum":{"$cond":["$gluten",1,0]}},
+                "rating_sum":        {"$sum":{"$ifNull":["$valid_rating",0]}},
+                "rating_count":      {"$sum":{"$cond":[{"$ne":["$valid_rating",None]},1,0]}},
+                "premium_count":     {"$sum":{"$cond":[{"$eq":["$price_numeric",3]},1,0]}},
+                "price_sum":         {"$sum":{"$ifNull":["$price_numeric",0]}},
+                "price_count":       {"$sum":{"$cond":[{"$ne":["$price_numeric",None]},1,0]}}
+            }}
+        ]
+        stats_res = await collection.aggregate(stats_pipeline).to_list(length=1)
+
+        overall_stats = {
+            "total_restaurants":     0,
+            "pct_total_restaurants": 0.0,
+            "vegan_count":           0,
+            "pct_vegan":             0.0,
+            "premium_count":         0,
+            "pct_premium":           0.0,
+            "avg_rating":            0.0,
+            "pct_avg_rating":        0.0,
+            "gluten_free_count":     0,
+            "pct_gluten_free":       0.0,
+            "avg_price_category":    "sin datos",
+            "avg_price_numeric":     0.0
+        }
+        if stats_res and stats_res[0].get("total", 0) > 0:
+            d = stats_res[0]
+            total   = d["total"]
+            vegan   = d["vegan_count"]
+            gluten  = d["gluten_free_count"]
+            premium = d["premium_count"]
+            avg_rt  = d["rating_sum"] / d["rating_count"] if d["rating_count"] > 0 else 0.0
+            price_avg_num = d["price_sum"] / d["price_count"] if d["price_count"] > 0 else 0.0
+            price_cat     = (
+                "barato"  if price_avg_num < 1.5 else
+                "regular" if price_avg_num < 2.5 else
+                "caro"
+            )
+
+            # Total dataset for pct_total_restaurants
+            dataset_total = await collection.count_documents({})
+
+            overall_stats.update({
+                "total_restaurants":     total,
+                "pct_total_restaurants": round(total / dataset_total * 100, 2) if dataset_total > 0 else 0.0,
+                "vegan_count":           vegan,
+                "pct_vegan":             round(vegan / total * 100, 2),
+                "premium_count":         premium,
+                "pct_premium":           round(premium / total * 100, 2),
+                "avg_rating":            round(avg_rt, 2),
+                "pct_avg_rating":        round(avg_rt / 5 * 100, 2),
+                "gluten_free_count":     gluten,
+                "pct_gluten_free":       round(gluten / total * 100, 2),
+                "avg_price_category":    price_cat,
+                "avg_price_numeric":     round(price_avg_num, 2)
+            })
+
+        # 4) Meals list distribution
+        meals_pipeline = [
+            {"$match": match_stage},
+            {"$unwind": "$meals_list"},
+            {"$group": {"_id":"$meals_list","count":{"$sum":1}}},
+            {"$project":{"_id":0,"meal":"$_id","count":1}}
+        ]
+        meals_dist = await collection.aggregate(meals_pipeline).to_list()
+
+        # 5) Top tags list distribution
+        tags_pipeline = [
+            {"$match": match_stage},
+            {"$unwind": "$top_tags_list"},
+            {"$group": {"_id":"$top_tags_list","count":{"$sum":1}}},
+            {"$project":{"_id":0,"tag":"$_id","count":1}}
+        ]
+        tags_dist = await collection.aggregate(tags_pipeline).to_list()
+
+
+        # 6) Clusters vs. listing
+        if zoom <= 15:
+            # clustering
+            if zoom <= 6:
+                max_px = 190
+            elif zoom <= 12:
+                max_px = 120
+            else:
+                max_px = 80
+            deg_px    = 360.0 / (256 * (2 ** zoom))
+            cell_size = max_px * deg_px
+
+            cluster_pipeline = [
+                {"$match": match_stage},
+
+                # recalculate derived fields per document
+                {"$addFields": {
+                    "vegan":         {"$eq":[{"$toLower":{"$toString":"$vegan_options"}}, "si"]},
+                    "gluten":        {"$eq":[{"$toLower":{"$toString":"$gluten_free"}},   "si"]},
+                    "valid_rating":  {"$cond":[
+                                         {"$and":[
+                                             {"$ne":["$avg_rating", None]},
+                                             {"$isNumber":"$avg_rating"},
+                                             {"$gt":["$avg_rating",   0]},
+                                             {"$lte":["$avg_rating",   5]}
+                                         ]},
+                                         "$avg_rating",
+                                         None
+                                     ]},
+                    "price_numeric": {"$switch":{
+                                         "branches":[
+                                             {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "barato"]},  "then":1},
+                                             {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "regular"]}, "then":2},
+                                             {"case":{"$eq":[{"$toLower":{"$toString":"$price_level_cat"}}, "caro"]},    "then":3}
+                                         ],
+                                         "default": None
+                                     }}
+                }},
+
+                # compute grid cell
+                {"$addFields": {
+                    "cellX": {"$floor": {"$divide":[{"$add":["$longitude",180]}, cell_size]}},
+                    "cellY": {"$floor": {"$divide":[{"$add":["$latitude",  90]}, cell_size]}}
+                }},
+
+                # group per cell
+                {"$group": {
+                    "_id":               {"x":"$cellX","y":"$cellY"},
+                    "total_restaurants": {"$sum":1},
+                    "latitude":          {"$avg":"$latitude"},
+                    "longitude":         {"$avg":"$longitude"},
+                    "vegan_count":       {"$sum":{"$cond":["$vegan",1,0]}},
+                    "gluten_free_count": {"$sum":{"$cond":["$gluten",1,0]}},
+                    "avgRatingCluster":  {"$avg":"$valid_rating"},
+                    "avgPriceCluster":   {"$avg":"$price_numeric"},
+                    "premium_count":     {"$sum":{"$cond":[{"$eq":["$price_numeric",3]},1,0]}}
+                }},
+
+                # final shape with percentages
+                {"$project": {
+                    "_id":                0,
+                    "total_restaurants":  1,
+                    "latitude":           {"$round":["$latitude",6]},
+                    "longitude":          {"$round":["$longitude",6]},
+                    "vegan_count":        1,
+                    "pct_vegan":          {"$round":[{"$multiply":[{"$divide":["$vegan_count","$total_restaurants"]},100]},2]},
+                    "gluten_free_count":  1,
+                    "pct_gluten_free":    {"$round":[{"$multiply":[{"$divide":["$gluten_free_count","$total_restaurants"]},100]},2]},
+                    "avg_rating":         {"$round":["$avgRatingCluster",2]},
+                    "pct_avg_rating":     {"$round":[{"$multiply":[{"$divide":["$avgRatingCluster",5]},100]},2]},
+                    "premium_count":      1,
+                    "pct_premium":        {"$round":[{"$multiply":[{"$divide":["$premium_count","$total_restaurants"]},100]},2]},
+                    "avg_price_category": {"$switch":{
+                                              "branches":[
+                                                  {"case":{"$lt":["$avgPriceCluster",1.5]},"then":"barato"},
+                                                  {"case":{"$lt":["$avgPriceCluster",2.5]},"then":"regular"}
+                                              ],
+                                              "default":"caro"
+                                          }}
+                }},
+
+                {"$limit": limit or 500}
+            ]
+            clusters = await collection.aggregate(cluster_pipeline).to_list(length=limit or 500)
+
+            payload = {
+                "overall_stats":   overall_stats,
+                "meals_list":      meals_dist,
+                "top_tags_list":   tags_dist,
+                "clusters":        clusters
+            }
+        else:
+            # paginated listing
+            total_count = await collection.count_documents(match_stage)
+            eff_limit   = limit or min(total_count, 100)
+            total_pages = math.ceil(total_count / eff_limit) if eff_limit > 0 else 1
+            page        = min(page, total_pages) if total_pages else 1
+            skip        = (page - 1) * eff_limit
+
+            cursor = (
+                collection
+                .find(match_stage, {
+                    "_id": 0,
+                    "name": 1,
+                    "city": 1,
+                    "country": 1,
+                    "latitude": 1,
+                    "longitude": 1,
+                    "avg_rating": 1,
+                    "price_level_cat": 1,
+                    "claimed": 1,
+                    "vegan_options": 1,
+                    "gluten_free": 1,
+                    "meals_list": 1,
+                    "top_tags_list": 1
+                })
+                .skip(skip)
+                .limit(eff_limit)
+            )
+
+            restaurants = await cursor.to_list(length=eff_limit)
+            for doc in restaurants:
+                for coord in ("latitude","longitude"):
+                    v = doc.get(coord)
+                    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                        doc[coord] = None
+
+            payload = {
+                "overall_stats":   overall_stats,
+                "meals_list":      meals_dist,
+                "top_tags_list":   tags_dist,
+                "restaurants":     restaurants,
+                "pagination": {
+                    "page":          page,
+                    "limit":         eff_limit,
+                    "total_pages":   total_pages,
+                    "total_results": total_count
                 }
             }
-        }},
-        {"$group": {
-            "_id": None,
-            "total": {"$sum": 1},
-            "vegetarian_count": {"$sum": {"$cond": ["$vegetarian", 1, 0]}},
-            "vegan_count": {"$sum": {"$cond": ["$vegan", 1, 0]}},
-            "gluten_free_count": {"$sum": {"$cond": ["$gluten", 1, 0]}},
-            "rating_sum": {"$sum": "$rating"},
-            "rating_count": {"$sum": {"$cond": [{"$ne": ["$rating", None]}, 1, 0]}},
-            "price_sum": {"$sum": "$price_value"},
-        }}
-    ]
 
-    result = await collection.aggregate(pipeline).to_list(length=1)
+        return JSONResponse(content=sanitize(payload))
 
-    if not result:
-        return {
-            "total_restaurants": 0,
-            "vegetarian_friendly": 0,
-            "vegan_options": 0,
-            "gluten_free": 0,
-            "avg_rating": 0,
-            "avg_price_category": "sin datos"
-        }
-
-    data = result[0]
-    rating_avg = data["rating_sum"] / data["rating_count"] if data["rating_count"] else 0
-    price_avg_num = data["price_sum"] / data["total"] if data["total"] else 0
-    price_cat_avg = (
-        "barato" if price_avg_num < 1.5 else
-        "regular" if price_avg_num < 2.5 else
-        "caro"
-    ) if data["total"] else "sin datos"
-
-    return {
-        "total_restaurants": data["total"],
-        "vegetarian_friendly": data["vegetarian_count"],
-        "vegan_options": data["vegan_count"],
-        "gluten_free": data["gluten_free_count"],
-        "avg_rating": round(rating_avg, 2),
-        "avg_price_category": price_cat_avg
-    }
-
-
-
-
-@router.post("/restaurant-locations")
-async def get_restaurant_locations(filters: FilterLocationParams):
-    query = {}
-
-    if filters.country:
-        query["country"] = filters.country
-    if filters.province:
-        query["province"] = filters.province
-    if filters.city:
-        query["city"] = filters.city
-
-    projection = {
-        "_id": 0,
-        "restaurant_name": 1,
-        "latitude": 1,
-        "longitude": 1,
-        "city": 1,
-        "province": 1,
-        "country": 1,
-        "avg_rating": 1,
-        "cuisines_list": 1
-    }
-
-    collection = db["restaurants"]
-    results = await collection.find(query, projection).to_list(length=10000)
-
-    return {"restaurants": results}
-
-
-
-
-
-
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Internal server error: {str(e)}"}
+        )
 
 
 
